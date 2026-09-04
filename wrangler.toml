@@ -1,3 +1,10 @@
 name = "leaseir-sat-not"
 main = "src/index.js"
 compatibility_date = "2026-01-01"
+
+# Variables de texto. Van aqui porque `wrangler deploy` borra las que se pongan
+# solo en el panel de Cloudflare. Los SECRETOS (JIRA_TOKEN, PANEL_CLAVE) no:
+# esos se ponen en el panel como Secret y wrangler los respeta.
+[vars]
+JIRA_EMAIL  = "avicente@leaseir.com"
+PANEL_GENTE = "Isaac,Chus,Gonzalo,Borja,Cristina,Alejandro"
