@@ -7,6 +7,7 @@ Worker de Cloudflare que escribe notas internas en Jira desde el panel del SAT.
 - `JIRA_EMAIL`  = avicente@leaseir.com
 - `JIRA_TOKEN`  = token de https://id.atlassian.com/manage-profile/security/api-tokens
 - `PANEL_CLAVE` = la cadena que el panel envia en cada peticion
+- `PANEL_GENTE` = nombres autorizados separados por comas
 
 Los tres van como **Secret**, no como variable de texto plano.
 

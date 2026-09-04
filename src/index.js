@@ -9,9 +9,9 @@
 //   JIRA_EMAIL   avicente@leaseir.com
 //   JIRA_TOKEN   token de api.atlassian.com
 //   PANEL_CLAVE  cadena que el panel manda en cada peticion
+//   PANEL_GENTE  nombres autorizados, separados por comas
 
 const BASE   = 'https://leaseir.atlassian.net';
-const GENTE  = ['Isaac', 'Chus', 'Gonzalo', 'Borja', 'Cristina', 'Alejandro'];
 const ORIGEN = 'https://alejandrovicente97.github.io';
 
 const cors = {
@@ -34,7 +34,8 @@ export default {
 
     if (clave !== env.PANEL_CLAVE)          return json({ error: 'clave' }, 401);
     if (!/^LEAS-\d{3,5}$/.test(leas || '')) return json({ error: 'leas' }, 400);
-    if (!GENTE.includes(quien))             return json({ error: 'quien' }, 400);
+    const gente = String(env.PANEL_GENTE || '').split(',').map(x => x.trim()).filter(Boolean);
+    if (!gente.length || !gente.includes(quien)) return json({ error: 'quien' }, 400);
     if (!texto || !texto.trim())            return json({ error: 'texto' }, 400);
     if (texto.length > 1500)                return json({ error: 'largo' }, 400);
 
