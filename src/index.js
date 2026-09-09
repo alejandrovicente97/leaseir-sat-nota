@@ -37,7 +37,8 @@ const json = (obj, status = 200) =>
 // GET /ticket/LEAS-x?clave=… → un ticket con sus últimos comentarios (buscador del panel).
 // Solo campos de estado: nada de direcciones, series ni importes. Lo gordo (/cola completa para calcular las
 // reglas en el navegador) espera a que el panel tenga Cloudflare Access o clave por persona.
-const CAMPOS_ESTADO = ['status', 'assignee', 'updated', 'statuscategorychangedate', 'issuetype', 'parent'];
+const CAMPOS_ESTADO = ['status', 'assignee', 'updated', 'statuscategorychangedate', 'issuetype', 'parent',
+  'customfield_10143', 'customfield_10144', 'customfield_10141'];   // técnico externo, cita estimada, cita agendada
 async function jql(H, q, fields, max = 100) {
   const out = []; let token = null;
   for (let i = 0; i < 8; i++) {
@@ -74,7 +75,8 @@ async function cola(env) {
     const f = i.fields || {};
     T[i.key] = { e: f.status && f.status.name, cat: f.status && f.status.statusCategory && f.status.statusCategory.key,
       resp: f.assignee ? f.assignee.displayName : null, upd: f.updated, cambio: f.statuscategorychangedate,
-      sub: !!(f.issuetype && f.issuetype.subtask), padre: f.parent ? f.parent.key : null };
+      sub: !!(f.issuetype && f.issuetype.subtask), padre: f.parent ? f.parent.key : null,
+      tec: f.customfield_10143 ? f.customfield_10143.value : null, cita: f.customfield_10144 || null, agenda: f.customfield_10141 || null };
   }
   for (const i of tocadas) {
     const f = i.fields || {};
