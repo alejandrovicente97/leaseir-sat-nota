@@ -25,16 +25,102 @@ const ORIGEN = 'https://alejandrovicente97.github.io';
 
 const cors = {
   'Access-Control-Allow-Origin': ORIGEN,
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
   'Vary': 'Origin'
 };
 const json = (obj, status = 200) =>
   new Response(JSON.stringify(obj), { status, headers: { ...cors, 'Content-Type': 'application/json' } });
 
+// ── Lectura en vivo (09/09/2026) ─────────────────────────────────────────────────────────────
+// GET /cola?clave=…      → estado de todas las abiertas + última nota de las tocadas en 36 h. Cacheado 60 s.
+// GET /ticket/LEAS-x?clave=… → un ticket con sus últimos comentarios (buscador del panel).
+// Solo campos de estado: nada de direcciones, series ni importes. Lo gordo (/cola completa para calcular las
+// reglas en el navegador) espera a que el panel tenga Cloudflare Access o clave por persona.
+const CAMPOS_ESTADO = ['status', 'assignee', 'updated', 'statuscategorychangedate', 'issuetype', 'parent'];
+async function jql(H, q, fields, max = 100) {
+  const out = []; let token = null;
+  for (let i = 0; i < 8; i++) {
+    const body = { jql: q, fields, maxResults: max };
+    if (token) body.nextPageToken = token;
+    const r = await fetch(`${BASE}/rest/api/3/search/jql`, {
+      method: 'POST', headers: { ...H, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!r.ok) throw new Error('jira ' + r.status + ' ' + (await r.text()).slice(0, 200));
+    const j = await r.json();
+    out.push(...(j.issues || []));
+    token = j.nextPageToken; if (!token || j.isLast) break;
+  }
+  return out;
+}
+function textoADF(b) {
+  if (!b) return ''; if (typeof b === 'string') return b;
+  const t = []; (function w(n) { if (!n) return; if (n.type === 'text') t.push(n.text || ''); (n.content || []).forEach(w); })(b);
+  return t.join('').replace(/\s+/g, ' ').trim();
+}
+function ultimaNota(cs) {
+  const c = (cs || []).slice().sort((a, b) => (a.created < b.created ? 1 : -1))[0];
+  if (!c) return null;
+  const tx = textoADF(c.body);
+  const m = tx.match(/^([A-Za-zÁÉÍÓÚÑáéíóúñ]+) \(vía panel, \d\d:\d\d\): /);
+  return { h: c.created, quien: m ? m[1] : (c.author && c.author.displayName) || '', txt: tx.slice(0, 120), panel: !!m };
+}
+async function cola(env) {
+  const auth = btoa(`${env.JIRA_EMAIL}:${env.JIRA_TOKEN}`);
+  const H = { Authorization: `Basic ${auth}`, Accept: 'application/json' };
+  const abiertas = await jql(H, 'project = LEAS AND statusCategory != Done', CAMPOS_ESTADO);
+  const tocadas  = await jql(H, 'project = LEAS AND updated >= -36h', ['comment', 'status'], 50);
+  const T = {};
+  for (const i of abiertas) {
+    const f = i.fields || {};
+    T[i.key] = { e: f.status && f.status.name, cat: f.status && f.status.statusCategory && f.status.statusCategory.key,
+      resp: f.assignee ? f.assignee.displayName : null, upd: f.updated, cambio: f.statuscategorychangedate,
+      sub: !!(f.issuetype && f.issuetype.subtask), padre: f.parent ? f.parent.key : null };
+  }
+  for (const i of tocadas) {
+    const f = i.fields || {};
+    const n = ultimaNota(f.comment && f.comment.comments);
+    if (!T[i.key]) T[i.key] = { e: f.status && f.status.name, cat: f.status && f.status.statusCategory && f.status.statusCategory.key, cerrado: true };
+    if (n) T[i.key].nota = n;
+  }
+  return { ok: true, hora: new Date().toISOString(), n: Object.keys(T).length, t: T };
+}
+async function ticket(env, key) {
+  const auth = btoa(`${env.JIRA_EMAIL}:${env.JIRA_TOKEN}`);
+  const H = { Authorization: `Basic ${auth}`, Accept: 'application/json' };
+  const r = await fetch(`${BASE}/rest/api/3/issue/${key}?fields=summary,status,assignee,created,updated,customfield_10211,customfield_10171,customfield_10150,customfield_10210,customfield_10143,comment,parent,subtasks`, { headers: H });
+  if (r.status === 404) return { ok: false, error: 'no_existe' };
+  if (!r.ok) throw new Error('jira ' + r.status);
+  const j = await r.json(); const f = j.fields || {};
+  const cs = (f.comment && f.comment.comments || []).slice(-5).reverse().map(c => ({ h: c.created, quien: (c.author && c.author.displayName) || '', txt: textoADF(c.body).slice(0, 300) }));
+  return { ok: true, key: j.key, estado: f.status && f.status.name, cat: f.status && f.status.statusCategory && f.status.statusCategory.key,
+    resp: f.assignee ? f.assignee.displayName : null, creado: f.created, upd: f.updated, centro: f.customfield_10211, consola: f.customfield_10171,
+    pistola: f.customfield_10150, averia: f.customfield_10210, tecnico: f.customfield_10143 && f.customfield_10143.value,
+    padre: f.parent ? f.parent.key : null, subtareas: (f.subtasks || []).map(x => x.key + ' ' + (x.fields && x.fields.status && x.fields.status.name || '')), notas: cs };
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+
+    if (request.method === 'GET') {
+      const u = new URL(request.url);
+      if (u.searchParams.get('clave') !== env.PANEL_CLAVE) return json({ error: 'clave' }, 401);
+      try {
+        if (u.pathname === '/cola') {
+          const cache = caches.default; const ck = new Request(u.origin + '/cola', { method: 'GET' });
+          const hit = await cache.match(ck);
+          if (hit) return new Response(hit.body, { headers: { ...cors, 'Content-Type': 'application/json', 'X-Cache': 'hit' } });
+          const c = await cola(env);
+          const resp = new Response(JSON.stringify(c), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=60' } });
+          await cache.put(ck, resp.clone());
+          return new Response(JSON.stringify(c), { headers: { ...cors, 'Content-Type': 'application/json', 'X-Cache': 'miss' } });
+        }
+        const m = u.pathname.match(/^\/ticket\/(LEAS-\d{3,5})$/);
+        if (m) return json(await ticket(env, m[1]));
+        return json({ error: 'ruta' }, 404);
+      } catch (e) { return json({ error: 'fallo', detalle: String((e && e.message) || e) }, 502); }
+    }
+
     if (request.method !== 'POST')    return json({ error: 'metodo' }, 405);
 
     let body;
