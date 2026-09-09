@@ -100,6 +100,94 @@ async function ticket(env, key) {
     padre: f.parent ? f.parent.key : null, subtareas: (f.subtasks || []).map(x => x.key + ' ' + (x.fields && x.fields.status && x.fields.status.name || '')), notas: cs };
 }
 
+// ── /explica/LEAS-x (09/09/2026): expediente en vivo + explicación con criterio ─────────────────────
+// Monta el expediente (ticket + historial + comentarios + tickets del mismo centro y de la misma consola) y se lo pasa
+// a un modelo con las reglas de la casa. Devuelve {ok, expediente, explicacion}. Caché 10 min. Secretos: ANTHROPIC_API_KEY.
+// Variable opcional ANTHROPIC_MODEL (por defecto claude-sonnet-4-5).
+const REGLAS = `Eres el controller del SAT de Leaseir (láseres de diodo en alquiler a centros de depilación en España, Italia,
+Francia y otros). Te dan el expediente de un ticket de Jira (proyecto LEAS) y tienes que explicar, en español y en 6-10
+líneas de prosa sin listas, qué está pasando, qué no cuadra y qué habría que pedir hoy en el ticket. Con hechos, fechas y
+horas del expediente; nunca inventes. Si algo no se puede saber con lo que hay, dilo.
+Reglas de la casa:
+- Estados que son CERRADO: Resuelto, Finalizada, Cancelado, Devuelto a fábrica, Finalizado técnico externo. Siguen abiertos:
+  Equipo devuelto, Devuelto a cliente, Inspección de salida. Desde «Resuelto» no se puede pasar a «Finalizada».
+- Principal = Tarea/Material. Subtareas: máquina de sustitución, queja de calidad (NO es trabajo del SAT), cobro
+  (administrativo). Las subtareas heredan ubicación y tracking del padre. Un principal puede tener varias hermanas.
+- No se recoge la averiada hasta que llega la sustitución al centro. Una serie en dos tickets no es duplicación si el
+  primer préstamo volvió («Equipo devuelto»).
+- Una máquina alquilada a un cliente (Traditional Renting / Renting S&L / Sold en el inventario) no puede salir como
+  préstamo a otro; al reparar vuelve a su dueño y se recupera la de sustitución.
+- SLA: recepción 4 h; reparación cliente (11122) 80 h; técnico externo (11056) 16 h desde «Enviado a técnico externo» —
+  si el ticket tiene técnico externo pero no está en ese estado, el reloj no corre y el panel no lo vigila.
+- La cita del técnico externo vive en «Fecha y hora estimada técnico externo» (ojo: a veces es transición + 24 h por
+  defecto), en «Fecha y hora agendada» o en un comentario («va hoy a las 15:30»). Si existe, no digas que falta.
+- Transporte medido: mediana 5,8 días, p90 26; Centri Unico p90 54 días. Un ticket parado en aduanas no es fallo del equipo.
+- Presupuestos y facturas se comprueban en Holded, no se deducen de Jira. No propongas facturar sin leer los comentarios.
+- Los chats (Telegram/WhatsApp) NO están en el expediente salvo lo volcado a Jira como «(por <grupo>, hh:mm)». Dilo.
+- Reincidencia: si la misma consola o el mismo centro repite síntoma, dilo con los tickets y fechas, y cuestiona repetir el
+  mismo arreglo. Distingue lo que depende del cliente (presupuesto sin firmar) de lo que depende del SAT.
+Estructura: primero qué pasa (una frase con el estado real), luego lo que no cuadra o se está ocultando, luego qué pedir
+hoy (concreto: a quién y qué). Tono: directo, sin adornos, sin nombres propios innecesarios del equipo.`;
+
+function adfTexto(b) { return textoADF(b); }
+async function expediente(env, key) {
+  const auth = btoa(`${env.JIRA_EMAIL}:${env.JIRA_TOKEN}`);
+  const H = { Authorization: `Basic ${auth}`, Accept: 'application/json' };
+  const F = 'summary,issuetype,status,created,updated,resolutiondate,assignee,reporter,parent,subtasks,labels,customfield_10211,customfield_10130,customfield_10138,customfield_10171,customfield_10150,customfield_10199,customfield_10200,customfield_10210,customfield_10140,customfield_10143,customfield_10144,customfield_10141,customfield_10182,customfield_10183,customfield_10184,customfield_10301,customfield_10128,customfield_11255,customfield_11288,customfield_11420,comment';
+  const r = await fetch(`${BASE}/rest/api/3/issue/${key}?fields=${F}&expand=changelog`, { headers: H });
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error('jira ' + r.status);
+  const j = await r.json(); const f = j.fields || {};
+  const v = x => x == null ? null : (typeof x === 'object' ? (x.value || x.name || x.displayName || x.key || null) : x);
+  const hist = (j.changelog && j.changelog.histories || []).flatMap(h => (h.items || [])
+    .filter(i => ['status', 'assignee', 'Nombre técnico externo', 'Fecha y hora estimada técnico externo', 'Fecha y hora agendada', 'Número de referencia de consola prestada', 'Número de referencia de handpiece prestado', 'Tracking ID recogida'].includes(i.field))
+    .map(i => ({ h: h.created.slice(0, 16).replace('T', ' '), quien: (h.author && h.author.displayName) || '', campo: i.field, de: i.fromString || '', a: i.toString || '' })))
+    .sort((a, b) => a.h < b.h ? -1 : 1);
+  const notas = (f.comment && f.comment.comments || []).map(c => ({ h: c.created.slice(0, 16).replace('T', ' '), quien: (c.author && c.author.displayName) || '', txt: adfTexto(c.body).slice(0, 400) }));
+  const centro = (f.customfield_10211 || '').trim(), consola = (f.customfield_10171 || '').trim();
+  let rel = [];
+  try {
+    const partes = [];
+    if (consola && consola.length >= 4) partes.push(`cf[10171] ~ "${consola.replace(/"/g, '')}"`);
+    if (centro) partes.push(`cf[10211] ~ "\\"${centro.replace(/"/g, '').replace(/\s+/g, ' ')}\\""`);
+    if (partes.length) {
+      const rr = await jql(H, `project = LEAS AND key != ${key} AND issuetype in standardIssueTypes() AND (${partes.join(' OR ')}) ORDER BY created DESC`,
+        ['status', 'created', 'resolutiondate', 'customfield_10210', 'customfield_10171', 'customfield_10143', 'customfield_10211'], 20);
+      rel = rr.slice(0, 15).map(i => ({ key: i.key, estado: v(i.fields.status), creado: i.fields.created.slice(0, 10), cerrado: (i.fields.resolutiondate || '').slice(0, 10) || null,
+        averia: (i.fields.customfield_10210 || '').slice(0, 120), consola: i.fields.customfield_10171 || '', tecnico: v(i.fields.customfield_10143), centro: i.fields.customfield_10211 || '' }));
+    }
+  } catch (e) { rel = [{ error: String(e.message || e) }]; }
+  return {
+    key: j.key, tipo: v(f.issuetype), estado: v(f.status), cat: f.status && f.status.statusCategory && f.status.statusCategory.key,
+    creado: f.created.slice(0, 16).replace('T', ' '), actualizado: f.updated.slice(0, 16).replace('T', ' '), cerrado: f.resolutiondate ? f.resolutiondate.slice(0, 16).replace('T', ' ') : null,
+    resp: v(f.assignee), abierto_por: v(f.reporter), padre: f.parent ? f.parent.key : null,
+    subtareas: (f.subtasks || []).map(x => `${x.key} ${(x.fields && x.fields.summary) || ''} · ${(x.fields && x.fields.status && x.fields.status.name) || ''}`),
+    etiquetas: f.labels || [], centro, propietario: f.customfield_10130 || '', direccion: f.customfield_10138 || '',
+    consola, pistola: f.customfield_10150 || '', prestada_consola: f.customfield_10199 || '', prestada_pistola: f.customfield_10200 || '',
+    averia: f.customfield_10210 || '', tipo_averia: v(f.customfield_10140), tecnico_externo: v(f.customfield_10143),
+    cita_estimada: f.customfield_10144 || null, cita_agendada: f.customfield_10141 || null,
+    garantia: v(f.customfield_10182), contrato: v(f.customfield_10183), requiere_pago: v(f.customfield_10184), importe: f.customfield_10301 || null,
+    forma_resolucion: v(f.customfield_10128), incidencias_previas_consola: f.customfield_11255, incidencias_previas_pistola: f.customfield_11288,
+    tracking: f.customfield_11420 || null, historial: hist, notas, relacionados: rel
+  };
+}
+async function explica(env, key) {
+  const ex = await expediente(env, key);
+  if (!ex) return { ok: false, error: 'no_existe' };
+  if (!env.ANTHROPIC_API_KEY) return { ok: true, expediente: ex, explicacion: null, aviso: 'sin_modelo' };
+  const hoy = new Intl.DateTimeFormat('es-ES', { timeZone: 'Europe/Madrid', dateStyle: 'full', timeStyle: 'short' }).format(new Date());
+  const cuerpo = `Hoy es ${hoy}.\n\nEXPEDIENTE DE ${key} (JSON):\n${JSON.stringify(ex, null, 1)}\n\nExplica qué pasa con este ticket.`;
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'x-api-key': env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+    body: JSON.stringify({ model: env.ANTHROPIC_MODEL || 'claude-sonnet-4-5', max_tokens: 900, system: REGLAS, messages: [{ role: 'user', content: cuerpo }] })
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) return { ok: true, expediente: ex, explicacion: null, aviso: 'modelo', detalle: (j.error && j.error.message) || r.status };
+  const texto = (j.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n').trim();
+  return { ok: true, expediente: ex, explicacion: texto, modelo: j.model, hora: new Date().toISOString() };
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
@@ -119,6 +207,18 @@ export default {
         }
         const m = u.pathname.match(/^\/ticket\/(LEAS-\d{3,5})$/);
         if (m) return json(await ticket(env, m[1]));
+        const mx = u.pathname.match(/^\/explica\/(LEAS-\d{3,5})$/);
+        if (mx) {
+          const cache = caches.default; const ck = new Request(u.origin + '/explica/' + mx[1] + (u.searchParams.get('fresco') ? '?f=' + Date.now() : ''), { method: 'GET' });
+          const hit = u.searchParams.get('fresco') ? null : await cache.match(ck);
+          if (hit) return new Response(hit.body, { headers: { ...cors, 'Content-Type': 'application/json', 'X-Cache': 'hit' } });
+          const c = await explica(env, mx[1]);
+          if (c.ok && c.explicacion) {
+            const resp = new Response(JSON.stringify(c), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=600' } });
+            await cache.put(ck, resp.clone());
+          }
+          return json(c);
+        }
         return json({ error: 'ruta' }, 404);
       } catch (e) { return json({ error: 'fallo', detalle: String((e && e.message) || e) }, 502); }
     }
