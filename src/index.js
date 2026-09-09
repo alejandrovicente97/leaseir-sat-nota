@@ -12,6 +12,13 @@
 //   PANEL_IDS    {"Nombre":"accountId", ...}   (texto)  -> para reasignar
 //   JIRA_TOKEN   token de api.atlassian.com    (SECRETO)
 //   PANEL_CLAVE  cadena que el panel manda     (SECRETO)
+//   TELEGRAM_TOKEN token del bot @leaseir_sat_monitor_bot (SECRETO)  -> puntos sin ticket
+//   TG_GRUPO     chat_id del grupo «SAT Leaseir - Herramienta Control Diario» (texto, -5461993276)
+//
+// Puntos SIN ticket (09/09/2026): el panel manda {sin_ticket:true, linea, quien, clave} y el worker
+// publica la línea en el grupo de la herramienta con el bot. Antes el técnico tenía que copiarla y
+// pegarla a mano, y si no lo hacía el punto volvía al día siguiente. Cloudflare sí llega a
+// api.telegram.org (desde la red de Leaseir está bloqueado).
 
 const BASE   = 'https://leaseir.atlassian.net';
 const ORIGEN = 'https://alejandrovicente97.github.io';
@@ -32,9 +39,29 @@ export default {
 
     let body;
     try { body = await request.json(); } catch { return json({ error: 'json' }, 400); }
-    const { leas, quien, texto, clave, para } = body || {};
+    const { leas, quien, texto, clave, para, sin_ticket, linea } = body || {};
 
     if (clave !== env.PANEL_CLAVE)          return json({ error: 'clave' }, 401);
+
+    // Punto sin ticket: al grupo de la herramienta por el bot, y fuera.
+    if (sin_ticket) {
+      const genteST = String(env.PANEL_GENTE || '').split(',').map(x => x.trim()).filter(Boolean);
+      if (!genteST.includes(quien))                 return json({ error: 'quien' }, 400);
+      const l = String(linea || '').trim();
+      if (!l || l.length > 600)                     return json({ error: 'linea' }, 400);
+      if (!env.TELEGRAM_TOKEN || !env.TG_GRUPO)     return json({ error: 'sin_bot' }, 503);
+      try {
+        const tg = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: env.TG_GRUPO, text: l + ' (vía panel)', disable_web_page_preview: true })
+        });
+        const tj = await tg.json().catch(() => ({}));
+        if (!tg.ok || !tj.ok) return json({ error: 'telegram', detalle: tj.description || tg.status }, 502);
+        return json({ ok: true, via: 'telegram', message_id: tj.result && tj.result.message_id });
+      } catch (e) {
+        return json({ error: 'fallo', detalle: String((e && e.message) || e) }, 500);
+      }
+    }
     if (!/^LEAS-\d{3,5}$/.test(leas || '')) return json({ error: 'leas' }, 400);
     const gente = String(env.PANEL_GENTE || '').split(',').map(x => x.trim()).filter(Boolean);
     if (!gente.length || !gente.includes(quien)) return json({ error: 'quien' }, 400);
