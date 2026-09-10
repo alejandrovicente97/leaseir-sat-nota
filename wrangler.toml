@@ -13,3 +13,9 @@ TG_GRUPO = "-5461993276"
 # accountId de Jira de cada uno, para poder reasignar el ticket desde el panel.
 # Chus es Jesus Fernandez Porrua.
 PANEL_IDS = '{"Isaac":"712020:4729552e-e656-47d9-87c1-75da30a1aebc","Chus":"712020:3b8aa9c9-4bff-42b0-af2b-c263f50179d8","Gonzalo":"712020:f0ef86b9-17de-4e75-a24c-ff139cffa977","Borja":"712020:6168e7f0-e7ef-4535-9843-e8cb8df7f679","Cristina":"712020:e2fdc4bc-4431-468a-bf3e-af93d13273cd","Alejandro":"712020:7b89ee48-14ce-4b1e-9f3e-218be8897551"}'
+
+# KV donde el worker guarda las notas de puntos sin ticket (nota / no aplica / se lo paso a) para que no se pierdan
+# aunque el bot de Telegram no esté. Se creó en el panel de Cloudflare el 10/09/2026; el id se rellena ahí.
+[[kv_namespaces]]
+binding = "NOTAS"
+id = "d7c550dae2c444418e2136b2ebbb7acc"

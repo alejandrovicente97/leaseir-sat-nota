@@ -207,6 +207,19 @@ export default {
         }
         const m = u.pathname.match(/^\/ticket\/(LEAS-\d{3,5})$/);
         if (m) return json(await ticket(env, m[1]));
+        if (u.pathname === '/notas') {
+          if (!env.NOTAS) return json({ ok: false, error: 'sin_kv' }, 503);
+          const dia = (u.searchParams.get('dia') || new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Madrid' }).format(new Date())).slice(0, 10);
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(dia)) return json({ error: 'dia' }, 400);
+          const out = []; let cursor = undefined;
+          do {
+            const page = await env.NOTAS.list({ prefix: 'n:' + dia + ':', cursor, limit: 1000 });
+            for (const k of page.keys) { const v = await env.NOTAS.get(k.name); if (v) { try { out.push(JSON.parse(v)); } catch (e) {} } }
+            cursor = page.list_complete ? undefined : page.cursor;
+          } while (cursor);
+          out.sort((a, b) => a.h < b.h ? -1 : 1);
+          return json({ ok: true, dia, n: out.length, notas: out });
+        }
         const mx = u.pathname.match(/^\/explica\/(LEAS-\d{3,5})$/);
         if (mx) {
           const cache = caches.default; const ck = new Request(u.origin + '/explica/' + mx[1] + (u.searchParams.get('fresco') ? '?f=' + Date.now() : ''), { method: 'GET' });
@@ -237,18 +250,32 @@ export default {
       if (!genteST.includes(quien))                 return json({ error: 'quien' }, 400);
       const l = String(linea || '').trim();
       if (!l || l.length > 600)                     return json({ error: 'linea' }, 400);
-      if (!env.TELEGRAM_TOKEN || !env.TG_GRUPO)     return json({ error: 'sin_bot' }, 503);
-      try {
-        const tg = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: env.TG_GRUPO, text: l + ' (vía panel)', disable_web_page_preview: true })
-        });
-        const tj = await tg.json().catch(() => ({}));
-        if (!tg.ok || !tj.ok) return json({ error: 'telegram', detalle: tj.description || tg.status }, 502);
-        return json({ ok: true, via: 'telegram', message_id: tj.result && tj.result.message_id });
-      } catch (e) {
-        return json({ error: 'fallo', detalle: String((e && e.message) || e) }, 500);
+      // 1) Guardar en KV (binding NOTAS). Es lo que hace que la nota no se pierda aunque no haya bot.
+      let guardado = false, clave = null;
+      if (env.NOTAS) {
+        try {
+          const ahora = new Date();
+          const dia = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/Madrid' }).format(ahora);   // AAAA-MM-DD
+          clave = `n:${dia}:${ahora.toISOString()}:${Math.random().toString(36).slice(2, 8)}`;
+          await env.NOTAS.put(clave, JSON.stringify({ h: ahora.toISOString(), quien, linea: l, id: String(body.id || '').slice(0, 200), tipo: String(body.tipo || '').slice(0, 20) }),
+            { expirationTtl: 60 * 60 * 24 * 120 });
+          guardado = true;
+        } catch (e) { guardado = false; }
       }
+      // 2) Telegram, si hay bot. Si falla pero está guardado, sigue siendo ok.
+      let telegram = false, detalle = null;
+      if (env.TELEGRAM_TOKEN && env.TG_GRUPO) {
+        try {
+          const tg = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: env.TG_GRUPO, text: l + ' (vía panel)', disable_web_page_preview: true })
+          });
+          const tj = await tg.json().catch(() => ({}));
+          telegram = !!(tg.ok && tj.ok); if (!telegram) detalle = tj.description || tg.status;
+        } catch (e) { detalle = String((e && e.message) || e); }
+      } else detalle = 'sin_bot';
+      if (!guardado && !telegram) return json({ error: detalle === 'sin_bot' ? 'sin_bot' : 'telegram', detalle }, detalle === 'sin_bot' ? 503 : 502);
+      return json({ ok: true, via: (guardado ? 'kv' : '') + (telegram ? (guardado ? '+telegram' : 'telegram') : ''), guardado, telegram, detalle, clave });
     }
     if (!/^LEAS-\d{3,5}$/.test(leas || '')) return json({ error: 'leas' }, 400);
     const gente = String(env.PANEL_GENTE || '').split(',').map(x => x.trim()).filter(Boolean);
